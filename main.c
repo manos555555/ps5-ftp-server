@@ -22,7 +22,7 @@
 
 #define FTP_PORT 2121
 #define DATA_PORT_START 2122
-#define BUFFER_SIZE (2 * 1024 * 1024)
+#define BUFFER_SIZE (4 * 1024 * 1024)
 #define MAX_PATH 1024
 
 typedef struct notify_request {
@@ -59,6 +59,16 @@ void send_response(int sock, const char *response) {
     char buffer[1024];
     snprintf(buffer, sizeof(buffer), "%s\r\n", response);
     send(sock, buffer, strlen(buffer), 0);
+}
+
+void send_error_response(int sock, int code, const char *msg) {
+    char response[256];
+    if (errno != 0) {
+        snprintf(response, sizeof(response), "%d %s (Error: %s)", code, msg, strerror(errno));
+    } else {
+        snprintf(response, sizeof(response), "%d %s", code, msg);
+    }
+    send_response(sock, response);
 }
 
 void handle_user(ftp_session_t *session, const char *arg) {
@@ -118,10 +128,19 @@ void handle_pasv(ftp_session_t *session) {
     int opt = 1;
     setsockopt(session->data_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
+    // Prevent SIGPIPE on write to closed socket (BSD/PS5 specific)
+    int no_sigpipe = 1;
+    setsockopt(session->data_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    
+    // 4MB buffers for maximum speed
     int sndbuf = BUFFER_SIZE;
     int rcvbuf = BUFFER_SIZE;
     setsockopt(session->data_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     setsockopt(session->data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
+    // Disable Nagle's algorithm for lower latency
+    int nodelay = 1;
+    setsockopt(session->data_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -141,7 +160,6 @@ void handle_pasv(ftp_session_t *session) {
     
     getsockname(session->control_sock, (struct sockaddr*)&addr, &addr_len);
     unsigned char *ip = (unsigned char*)&addr.sin_addr.s_addr;
-    unsigned short port = ntohs(addr.sin_port);
     
     char response[128];
     snprintf(response, sizeof(response), 
@@ -177,14 +195,32 @@ void handle_list(ftp_session_t *session, const char *path) {
             char full_path[MAX_PATH];
             snprintf(full_path, MAX_PATH, "%s/%s", session->current_dir, entry->d_name);
             
+            int is_dir = 0;
+            long file_size = 0;
+            
             if (stat(full_path, &st) == 0) {
-                snprintf(buffer, sizeof(buffer),
-                         "%crwxrwxrwx 1 root root %10ld Jan  1 00:00 %s\r\n",
-                         S_ISDIR(st.st_mode) ? 'd' : '-',
-                         (long)st.st_size,
-                         entry->d_name);
-                send(client_sock, buffer, strlen(buffer), 0);
+                is_dir = S_ISDIR(st.st_mode);
+                file_size = (long)st.st_size;
+            } else {
+                // stat() failed - use d_type as fallback
+                if (entry->d_type == DT_DIR) {
+                    is_dir = 1;
+                } else if (entry->d_type == DT_UNKNOWN) {
+                    // Try lstat as last resort
+                    if (lstat(full_path, &st) == 0) {
+                        is_dir = S_ISDIR(st.st_mode);
+                        file_size = (long)st.st_size;
+                    }
+                }
+                // If all fails, assume it's a file with size 0
             }
+            
+            snprintf(buffer, sizeof(buffer),
+                     "%crwxrwxrwx 1 root root %10ld Jan  1 00:00 %s\r\n",
+                     is_dir ? 'd' : '-',
+                     file_size,
+                     entry->d_name);
+            send(client_sock, buffer, strlen(buffer), 0);
         }
         closedir(dir);
     }
@@ -204,36 +240,144 @@ void handle_retr(ftp_session_t *session, const char *filename) {
     
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {
-        send_response(session->control_sock, "550 File not found");
+        send_error_response(session->control_sock, 550, "File not found");
         return;
     }
     
-    if (session->restart_offset > 0) {
-        lseek(fd, session->restart_offset, SEEK_SET);
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        send_error_response(session->control_sock, 550, "Cannot stat file");
+        close(fd);
+        return;
+    }
+    
+    off_t file_size = st.st_size;
+    off_t offset = session->restart_offset;
+    if (offset > 0) {
         session->restart_offset = 0;
+    }
+    
+    // Send start notification for files > 1MB
+    if (file_size > 1*1024*1024) {
+        char notif[128];
+        if (file_size > 1024*1024*1024) {
+            snprintf(notif, sizeof(notif), "FTP: Starting %s (%.2f GB)", 
+                    filename, (float)file_size / (1024*1024*1024));
+        } else {
+            snprintf(notif, sizeof(notif), "FTP: Starting %s (%.1f MB)", 
+                    filename, (float)file_size / (1024*1024));
+        }
+        send_notification(notif);
     }
     
     send_response(session->control_sock, "150 Opening data connection");
     
     int client_sock = accept(session->data_sock, NULL, NULL);
     if (client_sock < 0) {
-        send_response(session->control_sock, "425 Cannot open data connection");
+        send_error_response(session->control_sock, 425, "Cannot open data connection");
         close(fd);
         return;
     }
     
-    int sndbuf = BUFFER_SIZE * 2;
-    int rcvbuf = BUFFER_SIZE * 2;
-    int keepalive = 1;
+    // 4MB buffers for maximum speed
+    int sndbuf = BUFFER_SIZE;
+    int rcvbuf = BUFFER_SIZE;
     setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     
+    // Prevent SIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(client_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    
+    // Use TCP_NOPUSH for better throughput
     int nopush = 1;
     setsockopt(client_sock, IPPROTO_TCP, TCP_NOPUSH, &nopush, sizeof(nopush));
     
+    // Try zero-copy sendfile first (much faster!)
+    off_t bytes_to_send = file_size - offset;
+    off_t sent_total = 0;
+    
+    #ifdef __FreeBSD__
+    // PS5 uses FreeBSD - use sendfile for zero-copy transfer with progress tracking
+    off_t last_notif_bytes = 0;
+    off_t current_offset = offset;
+    
+    while (sent_total < bytes_to_send) {
+        off_t sbytes = 0;
+        off_t chunk_size = bytes_to_send - sent_total;
+        
+        // Send in chunks for progress tracking
+        int sf_result = sendfile(fd, client_sock, current_offset, chunk_size, NULL, &sbytes, 0);
+        
+        if (sbytes > 0) {
+            sent_total += sbytes;
+            current_offset += sbytes;
+            
+            // Progress notification every 500MB for large files
+            if (file_size > 500*1024*1024 && sent_total - last_notif_bytes >= 500*1024*1024) {
+                int percent = (int)((sent_total * 100) / bytes_to_send);
+                char notif[128];
+                snprintf(notif, sizeof(notif), "FTP: %s - %d%% (%.1f GB)", 
+                        filename, percent, (float)sent_total / (1024*1024*1024));
+                send_notification(notif);
+                last_notif_bytes = sent_total;
+            }
+            // Progress notification every 10MB for medium files
+            else if (file_size > 20*1024*1024 && sent_total - last_notif_bytes >= 10*1024*1024) {
+                int percent = (int)((sent_total * 100) / bytes_to_send);
+                char notif[128];
+                snprintf(notif, sizeof(notif), "FTP: %s - %d%%", filename, percent);
+                send_notification(notif);
+                last_notif_bytes = sent_total;
+            }
+        }
+        
+        if (sf_result == 0) {
+            // Transfer complete
+            break;
+        }
+        
+        if (sf_result < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;  // Retry
+            }
+            // Error - fall back to read/write
+            break;
+        }
+    }
+    
+    // Check if sendfile completed successfully
+    if (sent_total >= bytes_to_send) {
+        // Success - send completion notification
+        if (file_size > 1*1024*1024) {
+            char notif[128];
+            if (file_size > 1024*1024*1024) {
+                snprintf(notif, sizeof(notif), "FTP: Downloaded %s (%.2f GB)", 
+                        filename, (float)file_size / (1024*1024*1024));
+            } else {
+                snprintf(notif, sizeof(notif), "FTP: Downloaded %s (%.1f MB)", 
+                        filename, (float)file_size / (1024*1024));
+            }
+            send_notification(notif);
+        }
+        
+        nopush = 0;
+        setsockopt(client_sock, IPPROTO_TCP, TCP_NOPUSH, &nopush, sizeof(nopush));
+        close(fd);
+        close(client_sock);
+        send_response(session->control_sock, "226 Transfer complete");
+        return;
+    }
+    #endif
+    
+    // Fallback to traditional read/write if sendfile not available or failed
+    if (offset > 0) {
+        lseek(fd, offset, SEEK_SET);
+    }
+    
     char *buffer = malloc(BUFFER_SIZE);
     if (!buffer) {
-        send_response(session->control_sock, "451 Memory allocation failed");
+        send_error_response(session->control_sock, 451, "Memory allocation failed");
         close(client_sock);
         close(fd);
         return;
@@ -251,6 +395,16 @@ void handle_retr(ftp_session_t *session, const char *filename) {
             }
             if (sent == 0) break;
             bytes_sent += sent;
+        }
+        sent_total += bytes_sent;
+        
+        // Progress notification every 10MB
+        if (file_size > 20*1024*1024 && sent_total - last_notif_bytes > 10*1024*1024) {
+            int percent = (int)((sent_total * 100) / file_size);
+            char notif[128];
+            snprintf(notif, sizeof(notif), "FTP: %s - %d%%", filename, percent);
+            send_notification(notif);
+            last_notif_bytes = sent_total;
         }
     }
     
@@ -288,8 +442,13 @@ void handle_stor(ftp_session_t *session, const char *filename) {
         return;
     }
     
+    // 4MB receive buffer for maximum speed
     int rcvbuf = BUFFER_SIZE;
     setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
+    // Prevent SIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(client_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
     
     char *buffer = malloc(BUFFER_SIZE);
     if (!buffer) {
@@ -304,6 +463,10 @@ void handle_stor(ftp_session_t *session, const char *filename) {
         session->restart_offset = 0;
     }
     
+    // Track upload progress
+    off_t total_received = 0;
+    off_t last_notif_bytes = 0;
+    
     ssize_t n;
     while ((n = recv(client_sock, buffer, BUFFER_SIZE, 0)) > 0) {
         ssize_t written = 0;
@@ -316,6 +479,29 @@ void handle_stor(ftp_session_t *session, const char *filename) {
             if (w == 0) break;
             written += w;
         }
+        total_received += written;
+        
+        // Progress notification every 500MB for large uploads
+        if (total_received - last_notif_bytes >= 500*1024*1024) {
+            char notif[128];
+            snprintf(notif, sizeof(notif), "FTP: Uploading %s (%.1f GB)", 
+                    filename, (float)total_received / (1024*1024*1024));
+            send_notification(notif);
+            last_notif_bytes = total_received;
+        }
+    }
+    
+    // Send completion notification for uploads > 1MB
+    if (total_received > 1*1024*1024) {
+        char notif[128];
+        if (total_received > 1024*1024*1024) {
+            snprintf(notif, sizeof(notif), "FTP: Uploaded %s (%.2f GB)", 
+                    filename, (float)total_received / (1024*1024*1024));
+        } else {
+            snprintf(notif, sizeof(notif), "FTP: Uploaded %s (%.1f MB)", 
+                    filename, (float)total_received / (1024*1024));
+        }
+        send_notification(notif);
     }
     
     free(buffer);
@@ -471,6 +657,50 @@ void* client_thread(void* arg) {
             } else {
                 send_response(client_sock, "502 SITE command not implemented");
             }
+        } else if (strcmp(cmd, "SIZE") == 0) {
+            char filepath[MAX_PATH];
+            snprintf(filepath, MAX_PATH, "%s/%s", session.current_dir, arg);
+            struct stat st;
+            if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
+                char response[64];
+                snprintf(response, sizeof(response), "213 %lld", (long long)st.st_size);
+                send_response(client_sock, response);
+            } else {
+                send_error_response(client_sock, 550, "File not found or not a regular file");
+            }
+        } else if (strcmp(cmd, "MDTM") == 0) {
+            char filepath[MAX_PATH];
+            snprintf(filepath, MAX_PATH, "%s/%s", session.current_dir, arg);
+            struct stat st;
+            if (stat(filepath, &st) == 0) {
+                struct tm *tm = gmtime(&st.st_mtime);
+                char response[64];
+                snprintf(response, sizeof(response), "213 %04d%02d%02d%02d%02d%02d",
+                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                        tm->tm_hour, tm->tm_min, tm->tm_sec);
+                send_response(client_sock, response);
+            } else {
+                send_error_response(client_sock, 550, "File not found");
+            }
+        } else if (strcmp(cmd, "FEAT") == 0) {
+            send_response(client_sock, "211-Features:");
+            send_response(client_sock, " SIZE");
+            send_response(client_sock, " MDTM");
+            send_response(client_sock, " REST STREAM");
+            send_response(client_sock, " PASV");
+            send_response(client_sock, " UTF8");
+            send_response(client_sock, "211 End");
+        } else if (strcmp(cmd, "OPTS") == 0) {
+            char subcmd[16] = {0};
+            sscanf(arg, "%15s", subcmd);
+            for (int i = 0; subcmd[i]; i++) {
+                if (subcmd[i] >= 'a' && subcmd[i] <= 'z') subcmd[i] -= 32;
+            }
+            if (strcmp(subcmd, "UTF8") == 0) {
+                send_response(client_sock, "200 UTF8 enabled");
+            } else {
+                send_response(client_sock, "501 Option not supported");
+            }
         } else if (strcmp(cmd, "NOOP") == 0) {
             send_response(client_sock, "200 OK");
         } else {
@@ -487,19 +717,6 @@ void* client_thread(void* arg) {
 }
 
 int main() {
-    // Fork to background so elfldr can load other payloads
-    pid_t pid = fork();
-    if (pid > 0) {
-        // Parent process exits immediately
-        return 0;
-    }
-    if (pid < 0) {
-        // Fork failed, continue anyway
-    }
-    
-    // Child process continues as daemon
-    setsid();
-    
     int server_sock;
     struct sockaddr_in server_addr;
     
@@ -510,6 +727,15 @@ int main() {
     
     int opt = 1;
     setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    // Prevent SIGPIPE on server socket
+    int no_sigpipe = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    
+    // 4MB buffers for control connection
+    int buf_size = BUFFER_SIZE;
+    setsockopt(server_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    setsockopt(server_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
     
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;

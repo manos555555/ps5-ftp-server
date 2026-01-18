@@ -2,7 +2,7 @@
 
 PS5_HOST ?= 192.168.0.160
 PS5_PORT ?= 9021
-PS5_PAYLOAD_SDK := /home/hackman/ps5sdk_copy
+PS5_PAYLOAD_SDK := /opt/ps5-payload-sdk
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 

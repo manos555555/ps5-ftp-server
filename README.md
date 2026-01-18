@@ -2,23 +2,27 @@
 
 **By Manos**
 
-A high-performance FTP server for PS5 with etaHEN, optimized for maximum transfer speed.
+A high-performance FTP server for PS5 with etaHEN, optimized for maximum transfer speed and user experience.
 
 ## ✨ Features
 
 ### 🚀 Performance
-- **2MB Buffer Size** - Optimized for maximum throughput
+- **4MB Buffer Size** - Optimized for maximum throughput (67-70 Mbps sustained)
+- **Zero-Copy Transfers** - sendfile() optimization for downloads
+- **TCP Optimizations** - TCP_NOPUSH, SO_NOSIGPIPE for optimal performance
 - **High-speed transfers** - Fast file uploads and downloads
-- **Efficient socket handling** - SO_REUSEADDR and optimized buffers
 
 ### 📡 FTP Protocol
 - **Full FTP support** - LIST, RETR, STOR, DELE, CWD, PWD, MKD, RMD, RNFR, RNTO
+- **Extended commands** - SIZE, MDTM, FEAT, OPTS UTF8
 - **Passive Mode (PASV)** - Full support for passive transfers
 - **Binary transfers** - TYPE I for all file types
 - **Resume support** - REST command for resuming transfers
 
 ### 🎮 PS5 Integration
-- **PS5 Notifications** - Connection and transfer status
+- **Real-time Progress Notifications** - Upload/Download progress every 500MB
+- **Completion Notifications** - Success notifications for files > 1MB
+- **Start Notifications** - Download start notification for files > 1MB
 - **Custom Port** - Runs on port 2121 (configurable)
 - **Full filesystem access** - Browse entire PS5 filesystem
 
@@ -55,9 +59,10 @@ ftp YOUR_PS5_IP 2121
 
 ## 🎯 Supported Commands
 
+### Standard FTP Commands
 - **LIST** - List directory contents
-- **RETR** - Download file
-- **STOR** - Upload file
+- **RETR** - Download file (with sendfile optimization)
+- **STOR** - Upload file (with progress tracking)
 - **DELE** - Delete file
 - **CWD** - Change directory
 - **PWD** - Print working directory
@@ -68,21 +73,30 @@ ftp YOUR_PS5_IP 2121
 - **PASV** - Passive mode
 - **TYPE** - Set transfer type (Binary/ASCII)
 
+### Extended Commands (NEW!)
+- **SIZE** - Get file size before download
+- **MDTM** - Get file modification time
+- **FEAT** - List all supported features
+- **OPTS UTF8** - Enable UTF-8 encoding
+
 ## 🔧 Technical Details
 
 ### Backend
 - **Language**: C
+- **SDK**: PS5 Payload SDK v0.35
 - **Port**: 2121 (configurable)
-- **Buffer Size**: 2MB for optimal speed
+- **Buffer Size**: 4MB for optimal speed
 - **Transfer Mode**: Binary (TYPE I)
 - **Passive Mode**: Full PASV support
-- **Multi-threaded**: Yes
+- **Multi-threaded**: Yes (pthread)
 
 ### Performance Optimizations
-- Large socket buffers (2MB)
-- SO_REUSEADDR for quick restarts
-- Efficient file I/O
-- Binary transfer mode by default
+- **Zero-Copy Transfers**: sendfile() for downloads (FreeBSD)
+- **Large socket buffers**: 4MB (4,194,304 bytes)
+- **TCP optimizations**: TCP_NOPUSH, TCP_NODELAY, SO_NOSIGPIPE
+- **SO_REUSEADDR**: Quick server restarts
+- **Efficient file I/O**: Optimized read/write loops
+- **Binary transfer mode**: Default for all files
 
 ### Configuration
 
@@ -91,14 +105,20 @@ To change the port, edit `main.c`:
 #define FTP_PORT 2121  // Change this
 ```
 
+To change buffer size:
+```c
+#define BUFFER_SIZE (4 * 1024 * 1024)  // 4MB default
+```
+
 Then recompile.
 
 ## 📊 Performance
 
-- **Transfer Speed**: Limited only by network bandwidth
-- **Buffer Size**: 2MB (2,097,152 bytes)
+- **Transfer Speed**: 67-70 Mbps sustained (tested)
+- **Buffer Size**: 4MB (4,194,304 bytes)
 - **Concurrent Connections**: Sequential (one at a time)
 - **File Size Limit**: None (handles files of any size)
+- **Progress Tracking**: Real-time notifications every 500MB
 
 ## 🛡️ Security Notes
 
